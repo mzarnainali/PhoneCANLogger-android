@@ -2,25 +2,24 @@ package com.example.phonecanlogger;
 
 import android.app.Activity;
 import android.content.ContentValues;
+import android.content.SharedPreferences;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.MediaStore;
 import android.view.WindowManager;
-import android.widget.ArrayAdapter;
 import android.widget.Button;
-import android.widget.ListView;
+import android.widget.EditText;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.BufferedWriter;
+import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
-import java.net.DatagramPacket;
-import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
@@ -29,26 +28,25 @@ import java.util.Date;
 import java.util.Locale;
 
 /**
- * Finds ESP32RET / GVRET boards on the Wi-Fi network, connects to one,
- * and logs every CAN frame it receives to a CSV file in Downloads.
+ * A small "SavvyCAN helper" for your phone: type in the IP address of a
+ * GVRET / ESP32RET board, connect, and log every CAN frame to a CSV in Downloads.
  */
 public class MainActivity extends Activity {
 
-    private static final int DISCOVERY_PORT = 17222; // boards broadcast on this UDP port
-    private static final int GVRET_TCP_PORT = 23;    // we talk to the board on this TCP port
+    private static final int GVRET_TCP_PORT = 23;    // GVRET boards listen on this TCP port
+    private static final String PREFS_NAME = "settings";
+    private static final String PREF_LAST_IP = "last_ip";
     private static final String CSV_HEADER =
             "Time Stamp,ID,Extended,Dir,Bus,LEN,D1,D2,D3,D4,D5,D6,D7,D8\n";
 
     // --- screen ---
-    private ListView boardList;
+    private EditText ipInput;
     private Button connectButton;
     private Button logButton;
     private TextView statusText;
-    private ArrayAdapter<String> boardAdapter;
     private final Handler handler = new Handler(Looper.getMainLooper());
 
     // --- network ---
-    private DatagramSocket discoverySocket;
     private Socket socket;
     private volatile boolean connected = false;
 
@@ -67,19 +65,17 @@ public class MainActivity extends Activity {
         // Keep the screen on so logging doesn't stop while you drive.
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
-        boardList = findViewById(R.id.boardList);
+        ipInput = findViewById(R.id.ipInput);
         connectButton = findViewById(R.id.connectButton);
         logButton = findViewById(R.id.logButton);
         statusText = findViewById(R.id.statusText);
 
-        boardAdapter = new ArrayAdapter<>(this, android.R.layout.simple_list_item_single_choice);
-        boardList.setAdapter(boardAdapter);
-        boardList.setChoiceMode(ListView.CHOICE_MODE_SINGLE);
+        // Fill in the IP address used last time.
+        ipInput.setText(getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(PREF_LAST_IP, ""));
 
         connectButton.setOnClickListener(v -> onConnectClicked());
         logButton.setOnClickListener(v -> onLogClicked());
 
-        startDiscovery();
         updateStatusEverySecond();
     }
 
@@ -88,47 +84,8 @@ public class MainActivity extends Activity {
         super.onDestroy();
         handler.removeCallbacksAndMessages(null);
         stopLogging();
-        // Closing sockets is done on a background thread to keep the UI thread free of network calls.
-        new Thread(() -> {
-            closeQuietly(socket);
-            closeQuietly(discoverySocket);
-        }).start();
-    }
-
-    // ------------------------------------------------------------------
-    // Finding boards
-    // ------------------------------------------------------------------
-
-    /** Listens for the UDP broadcasts the boards send and lists each sender's IP once. */
-    private void startDiscovery() {
-        Thread thread = new Thread(() -> {
-            try {
-                DatagramSocket s = new DatagramSocket(null);
-                s.setReuseAddress(true); // so other apps (e.g. SavvyCAN) can listen too
-                s.bind(new InetSocketAddress(DISCOVERY_PORT));
-                discoverySocket = s;
-
-                byte[] buffer = new byte[1024];
-                DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
-                while (!s.isClosed()) {
-                    s.receive(packet);
-                    String ip = packet.getAddress().getHostAddress();
-                    runOnUiThread(() -> addBoard(ip));
-                }
-            } catch (IOException e) {
-                if (discoverySocket == null || !discoverySocket.isClosed()) {
-                    showToast("Board discovery failed: " + e.getMessage());
-                }
-            }
-        });
-        thread.setDaemon(true);
-        thread.start();
-    }
-
-    private void addBoard(String ip) {
-        if (boardAdapter.getPosition(ip) < 0) {
-            boardAdapter.add(ip);
-        }
+        // Close the socket on a background thread to keep network calls off the UI thread.
+        new Thread(() -> closeQuietly(socket)).start();
     }
 
     // ------------------------------------------------------------------
@@ -137,23 +94,22 @@ public class MainActivity extends Activity {
 
     private void onConnectClicked() {
         if (connected) {
-            disconnect();
+            new Thread(() -> closeQuietly(socket)).start(); // this ends the read loop
             return;
         }
 
-        int position = boardList.getCheckedItemPosition();
-        if (position == ListView.INVALID_POSITION) {
-            showToast("Tap a board in the list first");
+        String ip = ipInput.getText().toString().trim();
+        if (ip.isEmpty()) {
+            showToast("Type the IP address of the board first");
             return;
         }
 
-        String ip = boardAdapter.getItem(position);
+        // Remember it for next time.
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putString(PREF_LAST_IP, ip).apply();
+
         connectButton.setEnabled(false);
+        ipInput.setEnabled(false);
         new Thread(() -> connectAndRead(ip)).start();
-    }
-
-    private void disconnect() {
-        new Thread(() -> closeQuietly(socket)).start();
     }
 
     /** Runs on a background thread: connects, then reads until the connection ends. */
@@ -186,7 +142,7 @@ public class MainActivity extends Activity {
         } catch (IOException e) {
             // If we closed the socket ourselves (Disconnect button) there is nothing to report.
             if (!s.isClosed()) {
-                showToast("Connection problem: " + e.getMessage());
+                showToast("Could not connect or connection lost: " + e.getMessage());
             }
         } finally {
             closeQuietly(s);
@@ -194,6 +150,7 @@ public class MainActivity extends Activity {
             runOnUiThread(() -> {
                 connectButton.setText(R.string.connect);
                 connectButton.setEnabled(true);
+                ipInput.setEnabled(true);
             });
         }
     }
@@ -302,7 +259,7 @@ public class MainActivity extends Activity {
         runOnUiThread(() -> Toast.makeText(this, message, Toast.LENGTH_LONG).show());
     }
 
-    private static void closeQuietly(java.io.Closeable thing) {
+    private static void closeQuietly(Closeable thing) {
         if (thing == null) return;
         try {
             thing.close();
