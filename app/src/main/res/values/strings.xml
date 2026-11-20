@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PhoneCANLogger</string>
+    <string name="found_boards">Found GVRET Boards</string>
+    <string name="connect">Connect</string>
+    <string name="disconnect">Disconnect from Device</string>
+    <string name="start_logging">Start Logging</string>
+    <string name="stop_logging">Stop Logging</string>
+</resources>
