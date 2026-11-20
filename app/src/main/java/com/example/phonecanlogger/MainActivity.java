@@ -1,16 +1,25 @@
 package com.example.phonecanlogger;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ContentValues;
 import android.content.SharedPreferences;
+import android.graphics.Typeface;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.MediaStore;
+import android.util.TypedValue;
+import android.view.View;
+import android.view.ViewGroup;
 import android.view.WindowManager;
+import android.view.inputmethod.InputMethodManager;
+import android.widget.BaseAdapter;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
+import android.widget.ListView;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -24,16 +33,27 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.List;
 import java.util.Locale;
+import java.util.TreeMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * A small "SavvyCAN helper" for your phone: type in the IP address of a
- * GVRET / ESP32RET board, connect, and log every CAN frame to a CSV in Downloads.
+ * A small "SavvyCAN on your phone": connect to a GVRET / ESP32RET board by IP address,
+ * watch the CAN frames live, and log them to a CSV file in Downloads.
+ *
+ * Features: auto scroll, overwrite mode (one line per ID), ID filter.
+ * The filter applies to both the screen and the log file.
  */
 public class MainActivity extends Activity {
 
-    private static final int GVRET_TCP_PORT = 23;    // GVRET boards listen on this TCP port
+    private static final int GVRET_TCP_PORT = 23;   // GVRET boards listen on this TCP port
+    private static final int MAX_ROWS = 5000;       // most lines kept in the list (normal mode)
+    private static final int MAX_PENDING = 20000;   // most frames allowed to wait for the screen
+    private static final int REFRESH_MS = 100;      // the screen updates 10 times a second
     private static final String PREFS_NAME = "settings";
     private static final String PREF_LAST_IP = "last_ip";
     private static final String CSV_HEADER =
@@ -42,19 +62,39 @@ public class MainActivity extends Activity {
     // --- screen ---
     private EditText ipInput;
     private Button connectButton;
+    private Button filterButton;
+    private Button clearButton;
     private Button logButton;
+    private CheckBox autoScrollBox;
+    private CheckBox overwriteBox;
+    private ListView frameList;
     private TextView statusText;
+    private FrameAdapter adapter;
     private final Handler handler = new Handler(Looper.getMainLooper());
+    private int tickCount = 0;
+    private String lastStatus = "";
 
     // --- network ---
     private Socket socket;
     private volatile boolean connected = false;
+    private volatile long totalFrames = 0;      // every frame received
+    private volatile long acceptedFrames = 0;   // frames that passed the filter
+
+    // --- frames travelling from the network thread to the screen ---
+    private final ConcurrentLinkedQueue<FrameRow> pending = new ConcurrentLinkedQueue<>();
+    private final AtomicInteger pendingCount = new AtomicInteger();
+
+    // --- what the list shows (only touched on the UI thread) ---
+    private final List<FrameRow> appendRows = new ArrayList<>();                // normal mode
+    private final TreeMap<Long, FrameRow> latestByKey = new TreeMap<>();        // overwrite mode
+
+    private final FrameFilter filter = new FrameFilter();
 
     // --- logging (everything below is protected by logLock) ---
     private final Object logLock = new Object();
     private BufferedWriter logWriter;   // null when we are not logging
     private String logFileName = "";
-    private int framesCaptured = 0;
+    private int framesLogged = 0;
     private long bytesWritten = 0;
 
     @Override
@@ -67,16 +107,28 @@ public class MainActivity extends Activity {
 
         ipInput = findViewById(R.id.ipInput);
         connectButton = findViewById(R.id.connectButton);
+        filterButton = findViewById(R.id.filterButton);
+        clearButton = findViewById(R.id.clearButton);
         logButton = findViewById(R.id.logButton);
+        autoScrollBox = findViewById(R.id.autoScrollBox);
+        overwriteBox = findViewById(R.id.overwriteBox);
+        frameList = findViewById(R.id.frameList);
         statusText = findViewById(R.id.statusText);
+
+        adapter = new FrameAdapter();
+        frameList.setAdapter(adapter);
 
         // Fill in the IP address used last time.
         ipInput.setText(getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString(PREF_LAST_IP, ""));
 
         connectButton.setOnClickListener(v -> onConnectClicked());
         logButton.setOnClickListener(v -> onLogClicked());
+        filterButton.setOnClickListener(v -> showFilterDialog());
+        clearButton.setOnClickListener(v -> clearFrames());
+        // Switching between normal and overwrite mode starts the list fresh.
+        overwriteBox.setOnCheckedChangeListener((box, isChecked) -> clearFrames());
 
-        updateStatusEverySecond();
+        refreshScreen();
     }
 
     @Override
@@ -104,8 +156,10 @@ public class MainActivity extends Activity {
             return;
         }
 
-        // Remember it for next time.
+        // Remember it for next time and tuck the keyboard away.
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putString(PREF_LAST_IP, ip).apply();
+        InputMethodManager keyboard = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+        keyboard.hideSoftInputFromWindow(ipInput.getWindowToken(), 0);
 
         connectButton.setEnabled(false);
         ipInput.setEnabled(false);
@@ -124,15 +178,17 @@ public class MainActivity extends Activity {
             out.flush();
 
             socket = s;
+            totalFrames = 0;
+            acceptedFrames = 0;
             connected = true;
             runOnUiThread(() -> {
                 connectButton.setText(R.string.disconnect);
                 connectButton.setEnabled(true);
             });
 
-            GvretParser parser = new GvretParser(this::saveFrame);
+            GvretParser parser = new GvretParser(this::onFrameReceived);
             InputStream in = s.getInputStream();
-            byte[] buffer = new byte[1024];
+            byte[] buffer = new byte[4096];
             int count;
             while ((count = in.read(buffer)) != -1) {
                 for (int i = 0; i < count; i++) {
@@ -152,6 +208,148 @@ public class MainActivity extends Activity {
                 connectButton.setEnabled(true);
                 ipInput.setEnabled(true);
             });
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Frames coming in (network thread)
+    // ------------------------------------------------------------------
+
+    /** Called by the parser for every frame received. */
+    private void onFrameReceived(CanFrame frame) {
+        totalFrames++;
+
+        // The filter decides for both the screen and the log file.
+        if (!filter.accepts(frame.id)) return;
+        acceptedFrames++;
+
+        // Hand a copy to the screen. If the screen can't keep up we drop the copy, never the log line.
+        if (pendingCount.get() < MAX_PENDING) {
+            pending.add(FrameRow.from(frame));
+            pendingCount.incrementAndGet();
+        }
+
+        writeToLog(frame);
+    }
+
+    // ------------------------------------------------------------------
+    // The frame list (UI thread)
+    // ------------------------------------------------------------------
+
+    /** Runs 10 times a second: moves new frames into the list and updates the labels. */
+    private void refreshScreen() {
+        addPendingFramesToList();
+        updateFilterButton();
+        updateStatusText();
+        handler.postDelayed(this::refreshScreen, REFRESH_MS);
+    }
+
+    private void addPendingFramesToList() {
+        boolean overwrite = overwriteBox.isChecked();
+        boolean changed = false;
+
+        FrameRow row;
+        while ((row = pending.poll()) != null) {
+            pendingCount.decrementAndGet();
+            changed = true;
+            if (overwrite) {
+                // One line per bus + ID: replace the old line and count how often it arrived.
+                long key = ((long) row.bus << 32) | row.id;
+                FrameRow previous = latestByKey.get(key);
+                if (previous != null) row.count = previous.count + 1;
+                latestByKey.put(key, row);
+            } else {
+                appendRows.add(row);
+            }
+        }
+
+        // Normal mode keeps only the newest MAX_ROWS lines so memory stays small.
+        if (appendRows.size() > MAX_ROWS) {
+            appendRows.subList(0, appendRows.size() - MAX_ROWS).clear();
+        }
+
+        if (changed) showRows();
+    }
+
+    /** Gives the list the current rows and scrolls down if Auto scroll is on. */
+    private void showRows() {
+        boolean overwrite = overwriteBox.isChecked();
+        List<FrameRow> rows = overwrite ? new ArrayList<>(latestByKey.values()) : appendRows;
+        adapter.setRows(rows);
+        // Overwrite mode shows a fixed set of IDs, so there is nothing to scroll to.
+        if (autoScrollBox.isChecked() && !overwrite && !rows.isEmpty()) {
+            frameList.setSelection(rows.size() - 1);
+        }
+    }
+
+    private void clearFrames() {
+        pending.clear();
+        pendingCount.set(0);
+        appendRows.clear();
+        latestByKey.clear();
+        showRows();
+    }
+
+    // ------------------------------------------------------------------
+    // Filter
+    // ------------------------------------------------------------------
+
+    private void showFilterDialog() {
+        final long[] ids = filter.knownIds();
+        if (ids.length == 0) {
+            showToast("No frames seen yet. Connect first.");
+            return;
+        }
+
+        final String[] labels = new String[ids.length];
+        final boolean[] checked = new boolean[ids.length];
+        for (int i = 0; i < ids.length; i++) {
+            labels[i] = idLabel(ids[i]);
+            checked[i] = filter.isEnabled(ids[i]);
+        }
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Show and log these IDs")
+                .setMultiChoiceItems(labels, checked, (d, which, isChecked) -> checked[which] = isChecked)
+                .setPositiveButton("OK", (d, which) -> applyFilter(ids, checked))
+                .setNegativeButton("None", null)
+                .setNeutralButton("All", null)
+                .create();
+        dialog.show();
+
+        // "All" and "None" tick or untick the whole list without closing the dialog.
+        dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(v -> setAllChecked(dialog, checked, true));
+        dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener(v -> setAllChecked(dialog, checked, false));
+    }
+
+    private static void setAllChecked(AlertDialog dialog, boolean[] checked, boolean value) {
+        for (int i = 0; i < checked.length; i++) {
+            checked[i] = value;
+            dialog.getListView().setItemChecked(i, value);
+        }
+    }
+
+    private void applyFilter(long[] ids, boolean[] checked) {
+        filter.apply(ids, checked);
+
+        // Remove lines of IDs that are now switched off.
+        appendRows.removeIf(row -> !filter.isEnabled(row.id));
+        latestByKey.values().removeIf(row -> !filter.isEnabled(row.id));
+        showRows();
+        updateFilterButton();
+    }
+
+    private static String idLabel(long id) {
+        return id > 0x7FF ? String.format(Locale.US, "0x%08X", id) : String.format(Locale.US, "0x%03X", id);
+    }
+
+    private void updateFilterButton() {
+        String text = "Filter";
+        if (filter.isActive()) {
+            text = "Filter (" + filter.enabledCount() + "/" + filter.knownCount() + ")";
+        }
+        if (!text.contentEquals(filterButton.getText())) {
+            filterButton.setText(text);
         }
     }
 
@@ -192,7 +390,7 @@ public class MainActivity extends Activity {
             synchronized (logLock) {
                 logWriter = writer;
                 logFileName = name;
-                framesCaptured = 0;
+                framesLogged = 0;
                 bytesWritten = CSV_HEADER.length();
             }
             return true;
@@ -210,17 +408,17 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** Called by the parser (on the network thread) for every frame received. */
-    private void saveFrame(CanFrame frame) {
+    /** Writes one frame to the file. Only frames that passed the filter get here. */
+    private void writeToLog(CanFrame frame) {
         synchronized (logLock) {
             if (logWriter == null) return; // not logging right now
             String line = frame.toCsvLine();
             try {
                 logWriter.write(line);
-                framesCaptured++;
+                framesLogged++;
                 bytesWritten += line.length();
             } catch (IOException e) {
-                // Ignore a failed write; the status text will stop counting up.
+                // Ignore a failed write; the counter in the status text will stop going up.
             }
         }
     }
@@ -229,26 +427,74 @@ public class MainActivity extends Activity {
     // Status text
     // ------------------------------------------------------------------
 
-    /** Once a second: update the status box and push buffered data to the file. */
-    private void updateStatusEverySecond() {
+    private void updateStatusText() {
         StringBuilder text = new StringBuilder();
-        if (connected) {
-            text.append("Connected to a capture device.\n");
-        }
+        text.append(connected ? "Connected" : "Not connected");
+        text.append("  |  received ").append(totalFrames);
+        text.append(", passed filter ").append(acceptedFrames).append('\n');
+
         synchronized (logLock) {
             if (logWriter != null) {
-                try {
-                    logWriter.flush();
-                } catch (IOException e) {
-                    // ignore
+                // Push buffered data to the file about once a second.
+                if (tickCount % (1000 / REFRESH_MS) == 0) {
+                    try {
+                        logWriter.flush();
+                    } catch (IOException e) {
+                        // ignore
+                    }
                 }
-                text.append("Writing to file: Downloads/").append(logFileName).append('\n');
-                text.append("Number of frames captured: ").append(framesCaptured).append('\n');
-                text.append("File size: ").append(bytesWritten).append('\n');
+                text.append("Logging to Downloads/").append(logFileName).append('\n');
+                text.append(framesLogged).append(" frames logged, ").append(bytesWritten).append(" bytes");
             }
         }
-        statusText.setText(text);
-        handler.postDelayed(this::updateStatusEverySecond, 1000);
+        tickCount++;
+
+        String newStatus = text.toString();
+        if (!newStatus.equals(lastStatus)) {
+            lastStatus = newStatus;
+            statusText.setText(newStatus);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // List adapter: turns a FrameRow into one line of text
+    // ------------------------------------------------------------------
+
+    private class FrameAdapter extends BaseAdapter {
+        private List<FrameRow> rows = new ArrayList<>();
+
+        void setRows(List<FrameRow> newRows) {
+            rows = newRows;
+            notifyDataSetChanged();
+        }
+
+        @Override
+        public int getCount() {
+            return rows.size();
+        }
+
+        @Override
+        public Object getItem(int position) {
+            return rows.get(position);
+        }
+
+        @Override
+        public long getItemId(int position) {
+            return position;
+        }
+
+        @Override
+        public View getView(int position, View convertView, ViewGroup parent) {
+            TextView view = (TextView) convertView;
+            if (view == null) {
+                view = new TextView(MainActivity.this);
+                view.setTypeface(Typeface.MONOSPACE);
+                view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+                view.setPadding(4, 2, 4, 2);
+            }
+            view.setText(rows.get(position).toLine(overwriteBox.isChecked()));
+            return view;
+        }
     }
 
     // ------------------------------------------------------------------

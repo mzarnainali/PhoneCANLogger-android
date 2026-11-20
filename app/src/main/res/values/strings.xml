@@ -1,10 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">PhoneCANLogger</string>
-    <string name="ip_label">GVRET device IP address</string>
-    <string name="ip_hint">e.g. 192.168.4.1</string>
+    <string name="ip_hint">GVRET device IP, e.g. 192.168.4.1</string>
     <string name="connect">Connect</string>
-    <string name="disconnect">Disconnect from Device</string>
+    <string name="disconnect">Disconnect</string>
+    <string name="auto_scroll">Auto scroll</string>
+    <string name="overwrite_mode">Overwrite mode</string>
+    <string name="filter">Filter</string>
+    <string name="clear">Clear</string>
     <string name="start_logging">Start Logging</string>
     <string name="stop_logging">Stop Logging</string>
+    <string name="frame_header">  Time(s) ID       Bs Ln  Data</string>
 </resources>
