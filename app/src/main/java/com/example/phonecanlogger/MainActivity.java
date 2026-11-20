@@ -9,6 +9,7 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.provider.MediaStore;
 import android.util.TypedValue;
 import android.view.View;
@@ -45,7 +46,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  * A small "SavvyCAN on your phone": connect to a GVRET / ESP32RET board by IP address,
  * watch the CAN frames live, and log them to a CSV file in Downloads.
  *
- * Features: auto scroll, overwrite mode (one line per ID), ID filter.
+ * Features: auto scroll, overwrite mode (one line per ID), ID filter, and colours that show
+ * which bits changed (red = changed in the last 5 seconds, blue = changed earlier).
  * The filter applies to both the screen and the log file.
  */
 public class MainActivity extends Activity {
@@ -67,8 +69,10 @@ public class MainActivity extends Activity {
     private Button logButton;
     private CheckBox autoScrollBox;
     private CheckBox overwriteBox;
+    private CheckBox bitsBox;
     private ListView frameList;
     private TextView statusText;
+    private TextView legendText;
     private FrameAdapter adapter;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private int tickCount = 0;
@@ -89,6 +93,10 @@ public class MainActivity extends Activity {
     private final TreeMap<Long, FrameRow> latestByKey = new TreeMap<>();        // overwrite mode
 
     private final FrameFilter filter = new FrameFilter();
+
+    // --- bit change colours (UI thread only) ---
+    private final ChangeTracker tracker = new ChangeTracker();
+    private long lastChangeMs = 0;   // when any bit last changed, so we know when to keep repainting
 
     // --- logging (everything below is protected by logLock) ---
     private final Object logLock = new Object();
@@ -112,8 +120,11 @@ public class MainActivity extends Activity {
         logButton = findViewById(R.id.logButton);
         autoScrollBox = findViewById(R.id.autoScrollBox);
         overwriteBox = findViewById(R.id.overwriteBox);
+        bitsBox = findViewById(R.id.bitsBox);
         frameList = findViewById(R.id.frameList);
         statusText = findViewById(R.id.statusText);
+        legendText = findViewById(R.id.legendText);
+        legendText.setText(RowTextBuilder.legend());
 
         adapter = new FrameAdapter();
         frameList.setAdapter(adapter);
@@ -127,6 +138,8 @@ public class MainActivity extends Activity {
         clearButton.setOnClickListener(v -> clearFrames());
         // Switching between normal and overwrite mode starts the list fresh.
         overwriteBox.setOnCheckedChangeListener((box, isChecked) -> clearFrames());
+        // Hex <-> bits only changes how lines are drawn.
+        bitsBox.setOnCheckedChangeListener((box, isChecked) -> adapter.notifyDataSetChanged());
 
         refreshScreen();
     }
@@ -247,17 +260,21 @@ public class MainActivity extends Activity {
     private void addPendingFramesToList() {
         boolean overwrite = overwriteBox.isChecked();
         boolean changed = false;
+        long now = SystemClock.elapsedRealtime();
 
         FrameRow row;
         while ((row = pending.poll()) != null) {
             pendingCount.decrementAndGet();
             changed = true;
+
+            // Compare with the previous frame of this ID and remember which bits changed.
+            if (tracker.update(row, now)) lastChangeMs = now;
+
             if (overwrite) {
                 // One line per bus + ID: replace the old line and count how often it arrived.
-                long key = ((long) row.bus << 32) | row.id;
-                FrameRow previous = latestByKey.get(key);
+                FrameRow previous = latestByKey.get(row.key());
                 if (previous != null) row.count = previous.count + 1;
-                latestByKey.put(key, row);
+                latestByKey.put(row.key(), row);
             } else {
                 appendRows.add(row);
             }
@@ -268,7 +285,12 @@ public class MainActivity extends Activity {
             appendRows.subList(0, appendRows.size() - MAX_ROWS).clear();
         }
 
-        if (changed) showRows();
+        if (changed) {
+            showRows();
+        } else if (now < lastChangeMs + FrameRow.RECENT_MS + 2 * REFRESH_MS) {
+            // No new frames, but colours are still fading from red to blue, so redraw.
+            adapter.notifyDataSetChanged();
+        }
     }
 
     /** Gives the list the current rows and scrolls down if Auto scroll is on. */
@@ -287,6 +309,8 @@ public class MainActivity extends Activity {
         pendingCount.set(0);
         appendRows.clear();
         latestByKey.clear();
+        tracker.clear();
+        lastChangeMs = 0;
         showRows();
     }
 
@@ -492,7 +516,8 @@ public class MainActivity extends Activity {
                 view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
                 view.setPadding(4, 2, 4, 2);
             }
-            view.setText(rows.get(position).toLine(overwriteBox.isChecked()));
+            view.setText(RowTextBuilder.build(rows.get(position), bitsBox.isChecked(),
+                    overwriteBox.isChecked(), SystemClock.elapsedRealtime()));
             return view;
         }
     }

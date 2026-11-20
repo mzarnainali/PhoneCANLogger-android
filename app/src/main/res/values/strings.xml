@@ -6,6 +6,7 @@
     <string name="disconnect">Disconnect</string>
     <string name="auto_scroll">Auto scroll</string>
     <string name="overwrite_mode">Overwrite mode</string>
+    <string name="show_bits">Bits</string>
     <string name="filter">Filter</string>
     <string name="clear">Clear</string>
     <string name="start_logging">Start Logging</string>
